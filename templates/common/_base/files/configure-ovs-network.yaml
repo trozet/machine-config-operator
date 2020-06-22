@@ -1,0 +1,122 @@
+mode: 0755
+path: "/usr/local/bin/configure-ovs.sh"
+contents:
+  inline: |
+    #!/bin/bash
+    set -eux
+
+    iface=""
+    counter=0
+    # find default interface
+    while [ $counter -lt 12 ]; do
+      iface=$(ip route | grep default | head -n 1 | grep -Eo "dev\s[^ ]+" | sed 's/dev\s//')
+      if [ ! -z "$iface" ]; then
+        echo "Default gateway interface found: ${iface}"
+        break
+      fi
+      counter=$((counter+1))
+      echo "No default route found on attempt: ${counter}"
+      sleep 5
+    done
+
+    if [ -z "$iface" ]; then
+      echo "Unable to find default gateway interface"
+      exit 1
+    fi
+
+    # find the MAC of default interface to use for OVS internal port
+    # this prevents us from getting a different DHCP lease and dropping connection
+    iface_mac=$(cat /sys/class/net/${iface}/address)
+    if [ -z "$iface_mac" ]; then
+      echo "Unable to determine default interface MAC"
+      exit 1
+    fi
+
+    echo "MAC address found for iface: ${iface}: ${iface_mac}"
+
+    # find MTU on original iface
+    iface_mtu=$(ip link show ${iface} | grep -Eo "mtu\s[0-9]+" | sed 's/mtu\s//')
+    if [ -z "$iface_mtu" ]; then
+      echo "Unable to determine default interface MTU"
+      exit 1
+    fi
+
+    echo "MTU found for iface: ${iface}: ${iface_mtu}"
+
+    # store ipv4 address
+    iface_ip=""
+    if ip -4  addr show ${iface} |grep -Eo "([0-9]{1,3}[\.]){3}[0-9]{1,3}"; then
+      iface_ip=$(ip -4  addr show ${iface} | grep -Eo "([0-9]{1,3}[\.]){3}[0-9]{1,3}" | head -n 1)
+    fi
+
+    # create bridge
+    if ! nmcli connection show br-ex &> /dev/null; then
+      nmcli c add type ovs-bridge conn.interface br-ex con-name br-ex 802-3-ethernet.mtu ${iface_mtu} 802-3-ethernet.cloned-mac-address ${iface_mac}
+    fi
+
+    # find default port to add to bridge
+    if ! nmcli connection show ovs-port-phys0 &> /dev/null; then
+      nmcli c add type ovs-port conn.interface ${iface} master br-ex con-name ovs-port-phys0
+    fi
+
+    if ! nmcli connection show ovs-port-br-ex &> /dev/null; then
+      nmcli c add type ovs-port conn.interface br-ex master br-ex con-name ovs-port-br-ex
+    fi
+
+    if nmcli conn show --active | grep ${iface} | grep "Wired" ; then
+      old_conn=$(nmcli conn show --active | grep ${iface} | egrep '[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}' -o)
+      nmcli conn down $old_conn
+    fi
+
+    if ! nmcli connection show ovs-if-phys0 &> /dev/null; then
+      nmcli c add type 802-3-ethernet conn.interface ${iface} master ovs-port-phys0 con-name ovs-if-phys0 \
+        connection.autoconnect-priority 100 802-3-ethernet.mtu ${iface_mtu}
+    fi
+
+    if ! nmcli connection show ovs-if-br-ex &> /dev/null; then
+      nmcli c add type ovs-interface slave-type ovs-port conn.interface br-ex master ovs-port-br-ex con-name \
+        ovs-if-br-ex 802-3-ethernet.mtu ${iface_mtu}
+    fi
+
+    # setting MTU on ovs iface does not seem to propagate to OVS
+    # https://gitlab.freedesktop.org/NetworkManager/NetworkManager/-/issues/206
+    counter=0
+    until ovs-vsctl set Interface br-ex mtu_request=${iface_mtu}; do
+      if [ $counter -gt 20 ]; then
+        echo "WARN: failed to set MTU in OVS"
+        break
+      fi
+      echo "br-ex interface not yet present in OVS"
+      counter=$((counter+1))
+      sleep 1
+    done
+
+    # need to ensure we got the right DHCP IP
+    # there is a bug in NM where DHCP request may be sent with wrong MAC for OVS iface
+    # https://gitlab.freedesktop.org/NetworkManager/NetworkManager/-/issues/483
+    # workaround by bouncing networking until it picks the right iface if the original iface was ipv4
+    if [ ! -z "$iface_ip" ]; then
+      echo "checking iface IP matches original DHCP leased IP"
+      # sleep for a few seconds to allow DHCP to finish
+      sleep 5
+      counter=0
+      while [ $counter -lt 30 ]; do
+        new_iface_ip=$(ip -4  addr show br-ex |grep -Eo "([0-9]{1,3}[\.]){3}[0-9]{1,3}" | head -n 1)
+        if [ "$new_iface_ip" = "$iface_ip" ]; then
+          echo "DHCP successful on OVS iface"
+          exit 0
+        fi
+        counter=$((counter+1))
+        echo "WARN: IP does not match on attempt: ${counter}, original IP: ${iface_ip}, new IP: ${new_iface_ip}"
+        nmcli networking off
+        sleep 5
+        nmcli networking on
+        sleep 5
+      done
+    fi
+
+    # if we made it here networking isnt coming up, revert for debugging
+    nmcli conn down ovs-if-br-ex
+    nmcli conn down ovs-if-phys0
+    nmcli conn up $old_conn
+    exit 1
