@@ -91,6 +91,10 @@ contents:
       sleep 1
     done
 
+    nmcli conn down ovs-if-br-ex
+    sleep 5
+    nmcli conn up ovs-if-br-ex
+
     # need to ensure we got the right DHCP IP
     # there is a bug in NM where DHCP request may be sent with wrong MAC for OVS iface
     # https://gitlab.freedesktop.org/NetworkManager/NetworkManager/-/issues/483
