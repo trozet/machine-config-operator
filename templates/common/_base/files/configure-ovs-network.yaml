@@ -24,6 +24,11 @@ contents:
       exit 1
     fi
 
+    if [ "$iface" = "br-ex" ]; then
+      echo "Networking already configured and up for br-ex!"
+      exit 0
+    fi
+
     # find the MAC of default interface to use for OVS internal port
     # this prevents us from getting a different DHCP lease and dropping connection
     iface_mac=$(cat /sys/class/net/${iface}/address)
