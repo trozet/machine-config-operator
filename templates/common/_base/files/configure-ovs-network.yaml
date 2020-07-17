@@ -5,6 +5,103 @@ contents:
     #!/bin/bash
     set -eux
 
+    # Configures NICs onto OVS bridge "br-ex"
+    # Configuration is either auto-detected or provided through a config file written to
+    # /etc/sysconfig/network-scripts/ovs-config.yaml
+    # Example Config file:
+    # ---
+    # interfaces:
+    #   - name: br-ex
+    #     type: ovs-bridge
+    #     state: up
+    #     bridge:
+    #       port:
+    #         - name: bond0
+    #           vlan:
+    #             mode: access
+    #             tag: 2
+    #           link-aggregation:
+    #             lacp: active
+    #             mode: balance-slb
+    #             slaves:
+    #               - name: eth1
+    #               - name: eth2
+    #         - name: br-ex
+    #   - name: br-ex
+    #     type: ovs-interface
+    #     mtu: 9000
+    #     mac-address: 52:54:00:E0:64:7D
+    #
+    # This configuration file format is the same as what is used by nmstate. Only configuration options listed
+    # here are supported. The only configuration this file should contain is for configuring br-ex. Other interfaces
+    # are not supported.
+
+    parse_yaml() {
+      local yaml_file=$1
+      local prefix=$2
+      local s
+      local w
+      local fs
+
+      s='[[:space:]]*'
+      w='[a-zA-Z0-9_.-]*'
+      fs="$(echo @|tr @ '\034')"
+
+      (
+        sed -e '/- [^\“]'"[^\']"'.*: /s|\([ ]*\)- \([[:space:]]*\)|\1-\'$'\n''  \1\2|g' |
+
+        sed -ne '/^--/s|--||g; s|\"|\\\"|g; s/[[:space:]]*$//g;' \
+            -e "/#.*[\"\']/!s| #.*||g; /^#/s|#.*||g;" \
+            -e "s|^\($s\)\($w\)$s:$s\"\(.*\)\"$s\$|\1$fs\2$fs\3|p" \
+            -e "s|^\($s\)\($w\)${s}[:-]$s\(.*\)$s\$|\1$fs\2$fs\3|p" |
+
+        awk -F"$fs" '{
+            indent = length($1)/2;
+            if (length($2) == 0) { conj[indent]="+";} else {conj[indent]="";}
+            vname[indent] = $2;
+            for (i in vname) {if (i > indent) {delete vname[i]}}
+                if (length($3) > 0) {
+                    vn=""; for (i=0; i<indent; i++) {vn=(vn)(vname[i])("_")}
+                    printf("%s%s%s%s=(\"%s\")\n", "'"$prefix"'",vn, $2, conj[indent-1],$3);
+                }
+            }' |
+
+        sed -e 's/_=/+=/g' |
+
+        awk 'BEGIN {
+                FS="=";
+                OFS="="
+            }
+            /(-|\.).*=/ {
+                gsub("-|\\.", "_", $1)
+            }
+            { print }'
+      ) < "$yaml_file"
+    }
+
+    unset_variables() {
+      # Pulls out the variable names and unsets them.
+      local variable_string="$@"
+      unset variables
+      variables=()
+      for variable in ${variable_string[@]}; do
+        variables+=($(echo $variable | grep '=' | sed 's/=.*//' | sed 's/+.*//'))
+      done
+      for variable in ${variables[@]}; do
+        unset $variable
+      done
+    }
+
+    create_variables() {
+      local yaml_file="$1"
+      local prefix="$2"
+      local yaml_string="$(parse_yaml "$yaml_file" "$prefix")"
+      unset_variables ${yaml_string[@]}
+      eval "${yaml_string}"
+    }
+
+    CONFIG_FILE="/etc/sysconfig/network-scripts/ovs-config.yaml"
+
     iface=""
     counter=0
     # find default interface
@@ -19,58 +116,153 @@ contents:
       sleep 5
     done
 
-    if [ -z "$iface" ]; then
-      echo "Unable to find default gateway interface"
-      exit 1
-    fi
-
     if [ "$iface" = "br-ex" ]; then
       echo "Networking already configured and up for br-ex!"
       exit 0
     fi
 
-    # find the MAC of default interface to use for OVS internal port
+    phys_port_opts=""
+    CONFIG_PROVIDED=false
+    BONDING=false
+    # check if config file is provided at /etc/sysconfig/network-scripts/ovs-config.yaml
+    if [ -f "$CONFIG_FILE" ]; then
+      create_variables ${CONFIG_FILE} ovs_
+      echo "Variables parsed from OVS config file: $(compgen -A variable | grep ovs_)"
+
+      if [ ${#ovs_interfaces__name[@]} -gt 2 ]; then
+        echo "ERROR: multiple interfaces specified. Only one (br-ex bridge and port) may be specified in the config file"
+        exit 1
+      fi
+      CONFIG_PROVIDED=true
+
+      # Add VLAN args if they exist in config
+      if [ ! -z ${ovs_interfaces__bridge_port__vlan_tag:-} ]; then
+        phys_port_opts+="ovs-port.tag ${ovs_interfaces__bridge_port__vlan_tag}"
+      fi
+
+      if [ ! -z ${ovs_interfaces__bridge_port__vlan_mode:-} ]; then
+        phys_port_opts+=" ovs-port.vlan-mode ${ovs_interfaces__bridge_port__vlan_mode}"
+      fi
+
+      config_iface=""
+
+      # Check for bonding
+      if [ ! -z ${ovs_interfaces__bridge_port__link_aggregation_slaves__name:-} ]; then
+        BONDING=true
+        echo "Bonding detected in config file"
+        bonded_ifaces=("${ovs_interfaces__bridge_port__link_aggregation_slaves__name[@]}")
+        # If bonding, use the first interface listed for bond as config iface
+        config_iface=${bonded_ifaces[0]}
+        # Figure out bonding mode, valid values are "active-backup", "balance-slb", "balance-tcp"
+        VALID_BOND_MODES=("active-backup" "balance-slb" "balance-tcp")
+        if [ ! -z ${ovs_interfaces__bridge_port__link_aggregation_mode:-} ]; then
+          if [[ ! " ${VALID_BOND_MODES[@]} " =~ " ${ovs_interfaces__bridge_port__link_aggregation_mode} " ]]; then
+            echo "ERROR: Invalid value specified for BOND MODE: ${ovs_interfaces__bridge_port__link_aggregation_mode}"
+            exit 1
+          fi
+          phys_port_opts+=" ovs-port.bond-mode ${ovs_interfaces__bridge_port__link_aggregation_mode}"
+        else
+          # Check for LACP, valid settings are "active", "off", "passive"
+          VALID_LACP=("active" "off" "passive")
+          if [ ! -z ${ovs_interfaces__bridge_port__link_aggregation_lacp=:-} ]; then
+            if [[ ! " ${VALID_LACP[@]} " =~ " ${ovs_interfaces__bridge_port__link_aggregation_lacp} " ]]; then
+              echo "ERROR: Invalid value specified for LACP: ${ovs_interfaces__bridge_port__link_aggregation_lacp}"
+              exit 1
+            fi
+            phys_port_opts+=" ovs-port.lacp ${ovs_interfaces__bridge_port__link_aggregation_lacp}"
+          else
+            # Default to active/backup mode
+            phys_port_opts+=" ovs-port.bond-mode active-backup"
+          fi
+        fi
+      else
+        # check if port is specified if no bonding is used
+        if [ ! -z ${ovs_interfaces__bridge_port__name:-} ]; then
+          for port in ${ovs_interfaces__bridge_port__name[@]}; do
+            if [ "$port" != "br-ex" ]; then
+              config_iface=$port
+            fi
+          done
+        fi
+      fi
+
+      # Override detected interface with one in config file if present.
+      # This will only be used for trying to detect MTU or pick a MAC address if not provided in the config file
+      if [ -z "$config_iface" ]; then
+        echo "WARN: No bonding or physical interface specified in config file!"
+      else
+        echo "Interface detected via config file: ${config_iface}"
+        iface=$config_iface
+      fi
+      echo "Bonding and VLAN options found via config file: ${phys_port_opts}"
+    fi
+
+    if [ -z "$iface" ]; then
+      echo "ERROR: Unable to find default gateway interface and no configuration provided"
+      exit 1
+    fi
+
+    # find the MAC from OVS config or the default interface to use for OVS internal port
     # this prevents us from getting a different DHCP lease and dropping connection
-    if ! iface_mac=$(<"/sys/class/net/${iface}/address"); then
+    if ! iface_mac=${ovs_interfaces__mac_address[0]:-$(<"/sys/class/net/${iface}/address")}; then
       echo "Unable to determine default interface MAC"
       exit 1
     fi
 
     echo "MAC address found for iface: ${iface}: ${iface_mac}"
 
-    # find MTU on original iface
-    if ! iface_mtu=$(ip -j link show "$iface" | jq -r '.[0].mtu'); then
-      echo "Unable to determine default interface MTU"
-      exit 1
+    # find MTU from config or on original iface
+    iface_mtu=${ovs_interfaces__mtu[0]:-$(ip -j link show "$iface" | jq -r '.[0].mtu')}
+    if [ -z "$iface_mtu" ]; then
+      echo "Unable to determine default interface MTU, defaulting to 1500"
+      iface_mtu=1500
+    else
+      echo "MTU found for iface: ${iface}: ${iface_mtu}"
     fi
-
-    echo "MTU found for iface: ${iface}: ${iface_mtu}"
-
-    # store ipv4 address
-    iface_ip=$(ip -4 -j a show primary ${iface} | jq -r '.[0].addr_info[] | select (.scope=="global").local')
 
     # create bridge
     if ! nmcli connection show br-ex &> /dev/null; then
       nmcli c add type ovs-bridge conn.interface br-ex con-name br-ex 802-3-ethernet.mtu ${iface_mtu} 802-3-ethernet.cloned-mac-address ${iface_mac}
     fi
 
+    old_conns=()
+    if "$BONDING"; then
+      iface=bond0
+      # store old connections for bringing down later
+      for bond_iface in ${bonded_ifaces[@]}; do
+        old_conns+=($(nmcli --fields UUID,DEVICE conn show --active | grep ${bond_iface} | awk '{print $1}'))
+      done
+    else
+      old_conns+=($(nmcli --fields UUID,DEVICE conn show --active | grep ${iface} | awk '{print $1}'))
+    fi
+
     # find default port to add to bridge
     if ! nmcli connection show ovs-port-phys0 &> /dev/null; then
-      nmcli c add type ovs-port conn.interface ${iface} master br-ex con-name ovs-port-phys0
+      nmcli c add type ovs-port conn.interface ${iface} master br-ex con-name ovs-port-phys0 ${phys_port_opts}
     fi
 
     if ! nmcli connection show ovs-port-br-ex &> /dev/null; then
       nmcli c add type ovs-port conn.interface br-ex master br-ex con-name ovs-port-br-ex
     fi
 
-    if nmcli conn show --active | grep ${iface} | grep "Wired" ; then
-      old_conn=$(nmcli conn show --active | grep ${iface} | egrep '[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}' -o)
+    # bring down any old iface or bond connection (used for upgrading from local gw to shared gw mode)
+    for old_conn in ${old_conns[@]}; do
       nmcli conn down $old_conn
-    fi
+    done
 
-    if ! nmcli connection show ovs-if-phys0 &> /dev/null; then
-      nmcli c add type 802-3-ethernet conn.interface ${iface} master ovs-port-phys0 con-name ovs-if-phys0 \
-        connection.autoconnect-priority 100 802-3-ethernet.mtu ${iface_mtu}
+    if "$BONDING"; then
+      # Attach each interface as a slave to the bond ovs port
+      for bond_iface in ${bonded_ifaces[@]}; do
+        if ! nmcli connection show ovs-if-${bond_iface} &> /dev/null; then
+          nmcli c add type 802-3-ethernet conn.interface ${bond_iface} master ovs-port-phys0 con-name ovs-if-${bond_iface} \
+            connection.autoconnect-priority 100 802-3-ethernet.mtu ${iface_mtu}
+        fi
+      done
+    else
+      if ! nmcli connection show ovs-if-phys0 &> /dev/null; then
+        nmcli c add type 802-3-ethernet conn.interface ${iface} master ovs-port-phys0 con-name ovs-if-phys0 \
+          connection.autoconnect-priority 100 802-3-ethernet.mtu ${iface_mtu}
+      fi
     fi
 
     if ! nmcli connection show ovs-if-br-ex &> /dev/null; then
@@ -78,52 +270,44 @@ contents:
         ovs-if-br-ex 802-3-ethernet.mtu ${iface_mtu} 802-3-ethernet.cloned-mac-address ${iface_mac}
     fi
 
-    # setting MTU on ovs iface does not seem to propagate to OVS
-    # https://gitlab.freedesktop.org/NetworkManager/NetworkManager/-/issues/206
+    # wait for DHCP to finish, verify connection is up
     counter=0
-    until ovs-vsctl set Interface br-ex mtu_request=${iface_mtu}; do
-      if [ $counter -gt 20 ]; then
-        echo "WARN: failed to set MTU in OVS"
-        break
+    while [ $counter -lt 5 ]; do
+      sleep 5
+      # check if connection is active
+      if nmcli --fields GENERAL.STATE conn show ovs-if-br-ex | grep -i "activated"; then
+        echo "OVS successfully configured"
+        ip a show br-ex
+        exit 0
       fi
-      echo "br-ex interface not yet present in OVS"
       counter=$((counter+1))
-      sleep 1
     done
 
-    # bounce connection to make sure interface gets right MTU
-    # nmcli conn up cmd may return error if dhcp fails (see bug 483 below)
+    echo "WARN: OVS did not succesfully activate NM connection. Attempting to bring up connections"
+    counter=0
+    while [ $counter -lt 5 ]; do
+      if nmcli conn up ovs-if-br-ex; then
+        echo "OVS successfully configured"
+        ip a show br-ex
+        exit 0
+      fi
+      sleep 5
+      counter=$((counter+1))
+    done
+
+    echo "ERROR: Failed to activate ovs-if-br-ex NM connection"
+    # if we made it here networking isnt coming up, revert for debugging
     set +e
     nmcli conn down ovs-if-br-ex
-    sleep 5
-    nmcli conn up ovs-if-br-ex
-
-    # need to ensure we got the right DHCP IP
-    # there is a bug in NM where DHCP request may be sent with wrong MAC for OVS iface
-    # https://gitlab.freedesktop.org/NetworkManager/NetworkManager/-/issues/483
-    # workaround by bouncing networking until it picks the right mac if the original iface was ipv4
-    if [ ! -z "$iface_ip" ]; then
-      echo "checking iface IP matches original DHCP leased IP"
-      # sleep for a few seconds to allow DHCP to finish
-      sleep 10
-      counter=0
-      while [ $counter -lt 30 ]; do
-        new_iface_ip=$(ip -4 -j a show primary br-ex | jq -r '.[0].addr_info[] | select (.scope=="global").local')
-        if [ "$new_iface_ip" = "$iface_ip" ]; then
-          echo "DHCP successful on OVS iface"
-          exit 0
-        fi
-        counter=$((counter+1))
-        echo "WARN: IP does not match on attempt: ${counter}, original IP: ${iface_ip}, new IP: ${new_iface_ip}"
-        nmcli conn down ovs-if-br-ex
-        sleep 5
-        nmcli conn up ovs-if-br-ex
-        sleep 10
+    if "$BONDING"; then
+      for bond_iface in ${bonded_ifaces[@]}; do
+        nmcli conn down ovs-if-${bond_iface}
       done
+    else
+      nmcli conn down ovs-if-phys0
     fi
 
-    # if we made it here networking isnt coming up, revert for debugging
-    nmcli conn down ovs-if-br-ex
-    nmcli conn down ovs-if-phys0
-    nmcli conn up $old_conn
+    for old_conn in ${old_conns[@]}; do
+      nmcli conn up $old_conn
+    done
     exit 1
